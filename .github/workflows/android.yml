@@ -1,0 +1,205 @@
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+}
+
+# Native Android port feasibility assessment
+
+## Verdict
+**High difficulty; not a direct conversion.** The uploaded source identifies FNC Reborn as a native Windows x86-64 port. Its runtime uses ReXGlue for static recompilation and console services, and translates the Xbox 360 GPU to Direct3D 12. The repository itself says it requires Windows 10/11, x64, and a Direct3D 12-capable GPU.
+
+## Main blockers
+1. **CPU target:** current generated C++ and build assumptions target x86-64. Android's common target is `arm64-v8a`; the recompiler/code-generation/build pipeline must support it and validate PPC semantics on ARM64.
+2. **Graphics backend:** Direct3D 12 cannot be used as the native Android graphics API. A Vulkan backend or a proven compatibility translation layer is needed, including shader translation and GPU behavior.
+3. **System runtime:** Windows APIs, Xbox kernel services, threading, virtual memory, file APIs, audio, controller input, timers, and synchronization need Android implementations or abstractions.
+4. **Build system:** the existing CMake project requires generated sources and a `rexglue` package, and contains Windows-specific build settings. A separate Android CMake target and dependency graph will be needed.
+5. **Performance and device coverage:** a boxing game with a large statically recompiled codebase and GPU workload needs profiling on real ARM64 devices. Vulkan presence alone is not sufficient evidence of playability.
+6. **Game assets:** the repository explicitly excludes game code/data. Use only game data from the user's own lawful copy; do not bundle copyrighted game assets in an APK or public build.
+
+## Suggested staged plan
+- **Stage 0 — device probe:** build and run this project's Vulkan probe on the target phone.
+- **Stage 1 — runtime portability audit:** enumerate Windows/D3D12-only includes, APIs, compiler intrinsics, assembly, and SDK dependencies in ReXGlue and FNC Reborn.
+- **Stage 2 — ARM64 proof of concept:** compile a small generated-code sample for Android `arm64-v8a`; verify calling conventions, vector operations, exception/fault behavior, and floating-point fidelity.
+- **Stage 3 — runtime bring-up:** implement Android platform services and create a minimal Vulkan rendering path.
+- **Stage 4 — game boot:** load user-provided game files, reach menus, then test input, sound, save/load, and gameplay.
+- **Stage 5 — performance and compatibility:** profile thermals, memory, frame pacing, GPU correctness, and supported devices before calling it playable.
+
+## Go/no-go criteria
+Do not invest in a full game port until the team can (a) build ReXGlue runtime code for Android ARM64, (b) render a minimal Xbox 360 GPU workload through Vulkan, and (c) run a representative generated PowerPC code sample correctly. These are the three largest feasibility gates.
+
+## Sources
+- FNC Reborn repository README: https://github.com/whompay/FNCReborn
+- FNC Reborn technical architecture: https://github.com/whompay/FNCReborn/blob/main/docs/HOW_IT_WORKS.md
+- Android NDK Vulkan guidance: https://developer.android.com/ndk/guides/graphics
+
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+
+# FNC Reborn Android feasibility starter
+
+This is a **hardware/API probe**, not a playable port of FNC Reborn. It provides a minimal Android Studio project that checks whether the device exposes a Vulkan physical device through the Android NDK.
+
+## What this proves
+- Android Studio / Gradle project structure
+- Kotlin activity calling native C++ through JNI
+- NDK and Vulkan loader integrationplugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.fnc.reborn.androidprobe"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.fnc.reborn.androidprobe"
+        minSdk = 24
+        targetSdk = 35
+        versionCode = 1
+        versionName = "0.1-probe"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+}cmake_minimum_required(VERSION 3.22.1)
+project(fnc_probe LANGUAGES CXX)
+
+add_library(fnc_probe SHARED vulkan_probe.cpp)
+find_library(log-lib log)
+find_library(vulkan-lib vulkan)
+
+target_link_libraries(fnc_probe ${log-lib} ${vulkan-lib})
+
+#include <jni.h>
+#include <vulkan/vulkan.h>
+#include <string>
+#include <vector>
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_fnc_reborn_androidprobe_MainActivity_vulkanProbe(JNIEnv* env, jobject) {
+    uint32_t apiVersion = VK_API_VERSION_1_0;
+    auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+        vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
+    if (enumerateVersion) enumerateVersion(&apiVersion);
+
+    VkApplicationInfo appInfo{};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "FNC Reborn Android Probe";
+    appInfo.apiVersion = apiVersion;
+
+    VkInstanceCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    createInfo.pApplicationInfo = &appInfo;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    VkResult result = vkCreateInstance(&createInfo, nullptr, &instance);
+    if (result != VK_SUCCESS) {
+        std::string message = "Vulkan instance creation failed (VkResult " +
+                              std::to_string(static_cast<int>(result)) + ").";
+        return env->NewStringUTF(message.c_str());
+    }
+
+    uint32_t count = 0;
+    result = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    std::string message;
+    if (result != VK_SUCCESS || count == 0) {
+        message = "No Vulkan physical device was found. Native Android port feasibility is lower on this device.";
+    } else {
+        std::vector<VkPhysicalDevice> devices(count);
+        result = vkEnumeratePhysicalDevices(instance, &count, devices.data());
+        VkPhysicalDeviceProperties props{};
+        if (result == VK_SUCCESS) {
+            vkGetPhysicalDeviceProperties(devices[0], &props);
+            message = "Vulkan device found: ";
+            message += props.deviceName;
+            message += "\nVulkan API: ";
+            message += std::to_string(VK_VERSION_MAJOR(props.apiVersion)) + "." +
+                       std::to_string(VK_VERSION_MINOR(props.apiVersion)) + "." +
+                       std::to_string(VK_VERSION_PATCH(props.apiVersion));
+            message += "\nDevices enumerated: " + std::to_string(count);
+            message += "\nThis is only a basic capability check, not a performance test.";
+        } else {
+            message = "Vulkan device enumeration failed.";
+        }
+    }
+    vkDestroyInstance(instance, nullptr);
+    return env->NewStringUTF(message.c_str());
+}package com.fnc.reborn.androidprobe
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.TextView
+
+class MainActivity : Activity() {
+    private external fun vulkanProbe(): String
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val result = try {
+            vulkanProbe()
+        } catch (e: UnsatisfiedLinkError) {
+            "Native probe could not load: ${e.message}"
+        }
+
+        val view = TextView(this).apply {
+            textSize = 18f
+            setPadding(32, 48, 32, 32)
+            text = "FNC Reborn — Android feasibility probe\n\n$result\n\nThis is not the game. It only checks basic Vulkan device availability."
+        }
+        setContentView(view)
+    }
+
+    companion object {
+        init { System.loadLibrary("fnc_probe") }
+    }
+}
+
+
+
+- A first smoke test for the target phone's Vulkan availability
+
+## What it does not do
+- It does not run Fight Night Champion or include game code/data.
+- It does not port ReXGlue, the Xbox 360 kernel, Direct3D 12 graphics, audio, or input.
+- A successful Vulkan probe does not guarantee sufficient performance or compatibility.
+
+## Build
+1. Install a current Android Studio.
+2. Install Android SDK Platform 35 (or adjust `compileSdk`), NDK (side by side), and CMake through SDK Manager.
+3. Open this folder in Android Studio and let Gradle sync.
+4. Build and run on an Android 7.0+ device with Vulkan support.
+
+If Gradle requires a newer Android Gradle Plugin or Gradle wrapper, use Android Studio's suggested compatible versions.
+
+## Recommended next technical milestone
+Port and build a small, isolated portion of the ReXGlue runtime for `arm64-v8a` without game assets. Do not start by copying the Windows `project/CMakeLists.txt` unchanged: it currently expects generated sources and a `rexglue` package, and the game target uses Windows-specific configuration and Direct3D 12 runtime assumptions.
+
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "FNCRebornAndroidProbe"
+include(":app")
